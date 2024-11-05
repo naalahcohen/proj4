@@ -36,15 +36,15 @@ void cleanup() {
 void printStack(DirNode *dirStack) {
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        printf("%s", cwd);
+        dprintf(STDOUT_FILENO,"%s", cwd);
     }
 
     DirNode *current = dirStack;
     while (current) {
-        printf(" %s", current->directory);
+        dprintf(STDOUT_FILENO," %s", current->directory);
         current = current->next;
     }
-    printf("\n");
+    dprintf(STDOUT_FILENO,"\n");
 }
 
 //getting every local varibale 
@@ -82,7 +82,7 @@ int redirection(const CMD *cmdList) {
         close(fd);
     }
     else if (cmdList->toType == RED_OUT_APP) {
-        int fd = open(cmdList->toFile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int fd = open(cmdList->toFile, O_WRONLY | O_CREAT | O_APPEND, 0666);
         if (fd == -1) {
             perror("Error opening output file for appending");
             return errno;
@@ -184,17 +184,25 @@ int popd(int *status) {
 //either built in simple command 
 //not built in simple command 
 int builtin_simplecase(const CMD *cmdList, int *status) {
+    // *status = redirection(cmdList);
+    int saveout = dup(STDOUT_FILENO);
+    int redirect = redirection(cmdList);
+    // printf("here");
     if (cmdList->argv[0] == NULL) {
-        fprintf(stderr, "Error: Command is NULL\n");
-        *status = 1;
+        int error = errno;
+        perror("Error: Command is NULL\n");
+        dup2(saveout, STDOUT_FILENO);
+        *status = error;
         return *status;
     }
 
     if (cmdList->argv[0] != NULL && strcmp(cmdList->argv[0], "cd") == 0) {
         // Check for too many arguments
         if (cmdList->argc > 2) {
-            fprintf(stderr, "cd: too many arguments\n");
-            *status = 1;
+            int error = errno;
+            perror("cd: too many arguments\n");
+            dup2(saveout, STDOUT_FILENO);
+            *status = error;
             return *status;
         }
 
@@ -202,43 +210,60 @@ int builtin_simplecase(const CMD *cmdList, int *status) {
         if (cmdList->argv[1] == NULL) {
             const char *home = getenv("HOME");
             if (home == NULL) {
-                fprintf(stderr, "cd: HOME not set\n");
-                *status = 1;
+                //need to change to perror
+                int error = errno;
+                perror("cd: HOME not set\n");
+                dup2(saveout, STDOUT_FILENO);
+                *status = error;
                 return *status;
             }
             if (chdir(home) != 0) {
+                int error = errno;
                 perror("cd: error changing to HOME directory");
-                *status = (int)errno;
+                dup2(saveout, STDOUT_FILENO);
+                *status = error;
                 return *status;
             }
+            dup2(saveout, STDOUT_FILENO);
             *status = 0;
             return *status;
         }
 
         // Change to specified directory
         if (chdir(cmdList->argv[1]) != 0) {
+            int error = errno;
             perror("cd: error changing directory");
-            *status = (int)errno;
+            *status = error;
+            dup2(saveout, STDOUT_FILENO);
             return *status;
         }
+         dup2(saveout, STDOUT_FILENO);
         *status = 0;
         return *status;
     } 
     else if (cmdList->argv[0] != NULL && strcmp(cmdList->argv[0], "pushd") == 0) {
         // Ensure directory argument is provided
         if (cmdList->argc < 2 || cmdList->argv[1] == NULL) {
-            fprintf(stderr, "pushd: directory argument required\n");
-            *status = 1;
+            int error = errno;
+            perror("pushd: directory argument required\n");
+            *status = error;
             return *status;
         }
         // Call pushd with the specified directory
-        return pushd(cmdList->argv[1], status);
+        int pushed = pushd(cmdList->argv[1], status);
+        fflush(stdout);
+        dup2(saveout, STDOUT_FILENO);
+        return pushed;
     }
     else if (cmdList->argv[0] != NULL &&strcmp(cmdList->argv[0], "popd") == 0) {
         // Call popd to pop and change to the previous directory in the stack
-        return popd(status);
+        int popped = popd(status);
+        fflush(stdout);
+        dup2(saveout, STDOUT_FILENO);
+        return popped;
     }
-    
+    dup2(saveout, STDOUT_FILENO);
+    //printf("got to this line \n");
     *status = 1;  // Not a recognized built-in command
     return *status;
 }
@@ -254,6 +279,7 @@ int simple_case(const CMD *cmdList, int *status) {
         strcmp(cmdList->argv[0], "pushd") == 0 ||
         strcmp(cmdList->argv[0], "popd") == 0) {
         // Call builtin command and update status
+        // *status = redirection(cmdList);
         return builtin_simplecase(cmdList, status);
     }
 
@@ -353,7 +379,59 @@ int pipe_case(const CMD *cmdList, int *status) {
 
     return *status;
 }
+int groupcommand_case(const CMD *cmdList, int *status) {
+    if (cmdList->argv[0] == NULL) {
+        fprintf(stderr, "Error: Command is NULL\n");
+        *status = 1;
+        return *status;
+    }
 
+    if (strcmp(cmdList->argv[0], "cd") == 0 ||
+        strcmp(cmdList->argv[0], "pushd") == 0 ||
+        strcmp(cmdList->argv[0], "popd") == 0) {
+        return builtin_simplecase(cmdList, status);
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork failed");
+        *status = errno;
+        return *status;
+    }
+
+    if (pid == 0) {  // Child process
+        *status = redirection(cmdList);
+        if (*status != 0) {
+            exit(*status);
+        }
+
+        // Process the entire command list rather than a single command
+        if (process(cmdList) == -1) {  // Adjusted to pass the full `cmdList`
+            int error = errno;
+            perror("process failed");
+            exit(error);
+        }
+        exit(0);  // Success case
+    }
+
+    // Parent process waits for the child
+    int wait_status;
+    if (waitpid(pid, &wait_status, 0) == -1) {
+        perror("waitpid failed");
+        *status = errno;
+        return *status;
+    }
+
+    *status = STATUS(wait_status);
+    return *status;
+}
+
+
+// int background_case (const CMD *cmdList, int *status){
+
+// }
+
+//without pid 
 int subcommand_case(const CMD *cmdList, int *status) {
     pid_t pid = fork();
     if (pid == -1) {
@@ -370,13 +448,13 @@ int subcommand_case(const CMD *cmdList, int *status) {
     if (waitpid(pid, &wait_status, 0) == -1) {
         perror("waitpid failed for subcommand");
         *status = errno;  // Correctly assign the value to the dereferenced status pointer
-    } else {
+    } 
+    else {
         *status = STATUS(wait_status);  // Use STATUS macro to interpret exit status
     }
 
     return *status;
 }
-
 
 int process(const CMD *cmdList) {
     int status = 0;  // Default to success unless an error occurs
@@ -416,18 +494,23 @@ int process(const CMD *cmdList) {
     else if (cmdList->type == SEP_END) {
         if (cmdList->left != NULL) {
             getlocalvar(cmdList->left);
-            simple_case(cmdList->left, &status);
+            status = process(cmdList->left);
             clear_local_vars(cmdList->left);
         }
         if (cmdList->right != NULL) {
             getlocalvar(cmdList->right);
-            simple_case(cmdList->right, &status);
+            status = process(cmdList->right);
             clear_local_vars(cmdList->right);
         }
     }
     else if(cmdList->type == SUBCMD){
         getlocalvar(cmdList);
         subcommand_case(cmdList, &status); 
+        clear_local_vars(cmdList);
+    }
+    else if (cmdList->type == PAR_LEFT && cmdList->toType == PAR_RIGHT){
+        getlocalvar(cmdList);
+        groupcommand_case(cmdList,&status);
         clear_local_vars(cmdList);
     }
 
@@ -453,3 +536,12 @@ int process(const CMD *cmdList) {
 
 //~/cs323/proj4/starter-code$ /c/cs323/proj4/Bash 
 
+
+//if SEP_BG
+//WNOHANG
+//flag to check if something is backgrounded or not, pass the flag through
+//look at the flag and put in the double nohang
+//need to aslo print out, checl every time you go into process fucntion if there are any process in the background that have finished
+    //while loop that is continuly checkinf if there are any children that are done
+    ////print out the message "backgrounded" to terminal
+        //waitpid(-1) first arugment
