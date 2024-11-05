@@ -61,6 +61,22 @@ void clear_local_vars(const CMD *cmdList) {
     }
 }
 
+int map_errno_to_exit_status(int err, const char *cmd) {
+    if (err == ENOENT && (strcmp(cmd, "cd") == 0 || strcmp(cmd, "pushd") == 0)) {
+        return 2;  // Command failed due to missing file or directory
+    }
+    switch (err) {
+        case EINVAL:
+            return 2;  // Incorrect usage
+        case ENOENT:
+            return 127;  // Command not found for exec errors
+        case EACCES:
+            return 126;  // Permission denied
+        default:
+            return err;  // Return errno for general cases
+    }
+}
+
 int redirection(const CMD *cmdList) {
     // Redirect stdin to file
     if (cmdList->fromType == RED_IN) {
@@ -121,17 +137,24 @@ int redirection(const CMD *cmdList) {
     
     return 0;  // Success
 }
-int pushd(const char *dir, int *status) {
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        perror("pushd: getcwd failed");
-        *status = (int)errno;
+
+int pushd(const CMD *cmdList, int *status) {
+    if (cmdList->argc < 2 || cmdList->argv[1] == NULL) {  // Missing directory argument
+        fprintf(stderr, "usage: pushd <dirName>\n");
+        *status = 1;  // Usage error
         return *status;
     }
 
-    if (chdir(dir) != 0) {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        perror("pushd: getcwd failed");
+        *status = 2;  // Directory error if unable to get current directory
+        return *status;
+    }
+
+    if (chdir(cmdList->argv[1]) != 0) {  // Failed to change to the new directory
         perror("pushd: chdir failed");
-        *status = (int)errno;
+        *status = 2;
         return *status;
     }
 
@@ -139,134 +162,136 @@ int pushd(const char *dir, int *status) {
     if (!newNode) {
         perror("pushd: malloc failed");
         chdir(cwd);  // Restore original directory
-        *status = (int)errno;
+        *status = 1;  // Memory allocation error is a usage issue
         return *status;
     }
 
-    newNode->directory = strdup(cwd);
+    newNode->directory = strdup(cwd);  // Save previous directory
     if (!newNode->directory) {
         perror("pushd: strdup failed");
         free(newNode);
         chdir(cwd);  // Restore original directory
-        *status = (int)errno;
+        *status = 1;  // Memory allocation error is a usage issue
         return *status;
     }
 
     newNode->next = dirStack;
     dirStack = newNode;
 
-    printStack(dirStack);
+    printStack(dirStack);  // Show the updated stack
     *status = 0;
     return *status;
 }
 
+
+
 int popd(int *status) {
     if (dirStack == NULL) {
         fprintf(stderr, "popd: directory stack empty\n");
-        *status = 1;
+        *status = 1;  // Return 1 for empty stack error
         return *status;
     }
 
     DirNode *top = dirStack;
     if (chdir(top->directory) != 0) {
         perror("popd: chdir failed");
-        *status = (int)errno;
+        *status = map_errno_to_exit_status(errno, "popd");  // Map errno for consistent exit status
         return *status;
     }
+
     dirStack = dirStack->next;
     free(top->directory);
     free(top);
 
-    printStack(dirStack);
-    *status = 0;
+    printStack(dirStack);  // Print updated stack after pop
+    *status = 0;  // Success
     return *status;
 }
 //either built in simple command 
 //not built in simple command 
-int builtin_simplecase(const CMD *cmdList, int *status) {
-    // *status = redirection(cmdList);
-    int saveout = dup(STDOUT_FILENO);
-    int redirect = redirection(cmdList);
-    // printf("here");
-    if (cmdList->argv[0] == NULL) {
-        int error = errno;
-        perror("Error: Command is NULL\n");
-        dup2(saveout, STDOUT_FILENO);
-        *status = error;
+int cd_command(const CMD *cmdList, int *status) {
+    if (cmdList->argc > 2) {  // Too many arguments
+        fprintf(stderr, "usage: cd OR cd <dirName>\n");
+        *status = 1;  // Usage error
         return *status;
     }
 
-    if (cmdList->argv[0] != NULL && strcmp(cmdList->argv[0], "cd") == 0) {
-        // Check for too many arguments
-        if (cmdList->argc > 2) {
-            int error = errno;
-            perror("cd: too many arguments\n");
-            dup2(saveout, STDOUT_FILENO);
-            *status = error;
+    if (cmdList->argv[1] == NULL) {  // No argument provided; change to HOME
+        const char *home = getenv("HOME");
+        if (home == NULL) {
+            fprintf(stderr, "cd: HOME not set\n");
+            *status = 1;
             return *status;
         }
-
-        // No argument provided, use HOME directory
-        if (cmdList->argv[1] == NULL) {
-            const char *home = getenv("HOME");
-            if (home == NULL) {
-                //need to change to perror
-                int error = errno;
-                perror("cd: HOME not set\n");
-                dup2(saveout, STDOUT_FILENO);
-                *status = error;
-                return *status;
-            }
-            if (chdir(home) != 0) {
-                int error = errno;
-                perror("cd: error changing to HOME directory");
-                dup2(saveout, STDOUT_FILENO);
-                *status = error;
-                return *status;
-            }
-            dup2(saveout, STDOUT_FILENO);
-            *status = 0;
+        if (chdir(home) != 0) {  // Failed to access HOME directory
+            perror("cd: chdir fail");
+            *status = 2;  // Directory access error
             return *status;
         }
-
-        // Change to specified directory
-        if (chdir(cmdList->argv[1]) != 0) {
-            int error = errno;
-            perror("cd: error changing directory");
-            *status = error;
-            dup2(saveout, STDOUT_FILENO);
-            return *status;
-        }
-         dup2(saveout, STDOUT_FILENO);
         *status = 0;
         return *status;
-    } 
-    else if (cmdList->argv[0] != NULL && strcmp(cmdList->argv[0], "pushd") == 0) {
-        // Ensure directory argument is provided
-        if (cmdList->argc < 2 || cmdList->argv[1] == NULL) {
-            int error = errno;
-            perror("pushd: directory argument required\n");
-            *status = error;
-            return *status;
-        }
-        // Call pushd with the specified directory
-        int pushed = pushd(cmdList->argv[1], status);
-        fflush(stdout);
-        dup2(saveout, STDOUT_FILENO);
-        return pushed;
     }
-    else if (cmdList->argv[0] != NULL &&strcmp(cmdList->argv[0], "popd") == 0) {
-        // Call popd to pop and change to the previous directory in the stack
-        int popped = popd(status);
-        fflush(stdout);
-        dup2(saveout, STDOUT_FILENO);
-        return popped;
+
+    if (chdir(cmdList->argv[1]) != 0) {  // Failed to access specified directory
+        perror("cd: chdir fail");
+        *status = 2;
+        return *status;
     }
-    dup2(saveout, STDOUT_FILENO);
-    //printf("got to this line \n");
-    *status = 1;  // Not a recognized built-in command
+
+    *status = 0;  // Success
     return *status;
 }
+
+
+ 
+int builtin_simplecase(const CMD *cmdList, int *status) {
+    // Redirect output if necessary
+    int saveout = dup(STDOUT_FILENO);
+    if (saveout == -1) {
+        perror("dup failed");
+        *status = map_errno_to_exit_status(errno, "dup");
+        return *status;
+    }
+
+    int redirect = redirection(cmdList);
+    if (redirect != 0) {
+        *status = map_errno_to_exit_status(redirect, "redirection");  // Use mapped error for redirection issues
+        dup2(saveout, STDOUT_FILENO);  // Restore stdout in case of redirection error
+        close(saveout);
+        return *status;
+    }
+
+    // Check for and execute built-in commands
+    if (cmdList->argv[0] == NULL) {
+        fprintf(stderr, "Error: Command is NULL\n");
+        *status = 1;
+        dup2(saveout, STDOUT_FILENO);  // Restore stdout
+        close(saveout);
+        return *status;
+    }
+
+    if (strcmp(cmdList->argv[0], "cd") == 0) {
+        // Execute `cd` and handle status
+        *status = cd_command(cmdList, status);
+    }
+    else if (strcmp(cmdList->argv[0], "pushd") == 0) {
+        // Execute `pushd` and handle status
+        *status = pushd(cmdList, status);
+    }
+    else if (strcmp(cmdList->argv[0], "popd") == 0) {
+        // Execute `popd` and handle status
+        *status = popd(status);
+    } else {
+        *status = 1;  // Not a recognized built-in command
+    }
+
+    // Restore stdout in case of redirection
+    dup2(saveout, STDOUT_FILENO);
+    close(saveout);
+    return *status;
+}
+
+
 
 int simple_case(const CMD *cmdList, int *status) {
     if (cmdList->argv[0] == NULL) {
@@ -380,16 +405,10 @@ int pipe_case(const CMD *cmdList, int *status) {
     return *status;
 }
 int groupcommand_case(const CMD *cmdList, int *status) {
-    if (cmdList->argv[0] == NULL) {
+    if (cmdList == NULL) {
         fprintf(stderr, "Error: Command is NULL\n");
         *status = 1;
         return *status;
-    }
-
-    if (strcmp(cmdList->argv[0], "cd") == 0 ||
-        strcmp(cmdList->argv[0], "pushd") == 0 ||
-        strcmp(cmdList->argv[0], "popd") == 0) {
-        return builtin_simplecase(cmdList, status);
     }
 
     pid_t pid = fork();
@@ -405,13 +424,23 @@ int groupcommand_case(const CMD *cmdList, int *status) {
             exit(*status);
         }
 
-        // Process the entire command list rather than a single command
-        if (process(cmdList) == -1) {  // Adjusted to pass the full `cmdList`
-            int error = errno;
-            perror("process failed");
-            exit(error);
+        // Process left command
+        if (cmdList->left != NULL) {
+            int left_status = process(cmdList->left);
+            if (left_status != 0) {
+                exit(left_status);  // Exit if the left command fails
+            }
         }
-        exit(0);  // Success case
+
+        // Process right command
+        if (cmdList->right != NULL) {
+            int right_status = process(cmdList->right);
+            if (right_status != 0) {
+                exit(right_status);  // Exit if the right command fails
+            }
+        }
+
+        exit(0);  // Success if all commands in the group run successfully
     }
 
     // Parent process waits for the child
@@ -422,9 +451,11 @@ int groupcommand_case(const CMD *cmdList, int *status) {
         return *status;
     }
 
-    *status = STATUS(wait_status);
+    *status = STATUS(wait_status);  // Update status based on the child process exit
     return *status;
 }
+
+
 
 
 // int background_case (const CMD *cmdList, int *status){
