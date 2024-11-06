@@ -137,11 +137,15 @@ int redirection(const CMD *cmdList) {
     
     return 0;  // Success
 }
-
 int pushd(const CMD *cmdList, int *status) {
+    // Check if there are no or too many arguments
     if (cmdList->argc < 2 || cmdList->argv[1] == NULL) {  // Missing directory argument
         fprintf(stderr, "usage: pushd <dirName>\n");
-        *status = 1;  // Usage error
+        *status = 1;  // Usage error (return 1)
+        return *status;
+    } else if (cmdList->argc > 2) {  // Too many arguments
+        fprintf(stderr, "pushd: too many arguments\n");
+        *status = 1;  // Usage error (return 1)
         return *status;
     }
 
@@ -154,7 +158,7 @@ int pushd(const CMD *cmdList, int *status) {
 
     if (chdir(cmdList->argv[1]) != 0) {  // Failed to change to the new directory
         perror("pushd: chdir failed");
-        *status = 2;
+        *status = 2;  // Directory error for chdir failure
         return *status;
     }
 
@@ -162,7 +166,7 @@ int pushd(const CMD *cmdList, int *status) {
     if (!newNode) {
         perror("pushd: malloc failed");
         chdir(cwd);  // Restore original directory
-        *status = 1;  // Memory allocation error is a usage issue
+        *status = 1;  // Memory allocation failure is treated as a usage error (return 1)
         return *status;
     }
 
@@ -171,7 +175,7 @@ int pushd(const CMD *cmdList, int *status) {
         perror("pushd: strdup failed");
         free(newNode);
         chdir(cwd);  // Restore original directory
-        *status = 1;  // Memory allocation error is a usage issue
+        *status = 1;  // Memory allocation failure is treated as a usage error (return 1)
         return *status;
     }
 
@@ -182,6 +186,8 @@ int pushd(const CMD *cmdList, int *status) {
     *status = 0;
     return *status;
 }
+
+
 
 
 
@@ -404,63 +410,7 @@ int pipe_case(const CMD *cmdList, int *status) {
 
     return *status;
 }
-int groupcommand_case(const CMD *cmdList, int *status) {
-    if (cmdList == NULL) {
-        fprintf(stderr, "Error: Command is NULL\n");
-        *status = 1;
-        return *status;
-    }
 
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork failed");
-        *status = errno;
-        return *status;
-    }
-
-    if (pid == 0) {  // Child process
-        *status = redirection(cmdList);
-        if (*status != 0) {
-            exit(*status);
-        }
-
-        // Process left command
-        if (cmdList->left != NULL) {
-            int left_status = process(cmdList->left);
-            if (left_status != 0) {
-                exit(left_status);  // Exit if the left command fails
-            }
-        }
-
-        // Process right command
-        if (cmdList->right != NULL) {
-            int right_status = process(cmdList->right);
-            if (right_status != 0) {
-                exit(right_status);  // Exit if the right command fails
-            }
-        }
-
-        exit(0);  // Success if all commands in the group run successfully
-    }
-
-    // Parent process waits for the child
-    int wait_status;
-    if (waitpid(pid, &wait_status, 0) == -1) {
-        perror("waitpid failed");
-        *status = errno;
-        return *status;
-    }
-
-    *status = STATUS(wait_status);  // Update status based on the child process exit
-    return *status;
-}
-
-
-
-
-// int background_case (const CMD *cmdList, int *status){
-
-// }
 
 //without pid 
 int subcommand_case(const CMD *cmdList, int *status) {
@@ -471,6 +421,20 @@ int subcommand_case(const CMD *cmdList, int *status) {
         return errno;
     }
     if (pid == 0) {  // Child process
+        int fd_in = -1;
+        int fd_out = -1; 
+        if(cmdList->fromType != NONE){
+            fd_in = open(cmdList->fromFile, O_RDONLY);
+            if(fd_in == -1){
+                perror("open input handle_submcd err");
+                exit(errno); 
+            }
+            if(dup2(fd_in, STDIN_FILENO) == -1){
+                perror("");
+                close(fd_in );
+                exit(errno);
+            }
+        }
         exit(process(cmdList->left));  // Process the subcommand and exit with its status
     }
 
@@ -487,71 +451,117 @@ int subcommand_case(const CMD *cmdList, int *status) {
     return *status;
 }
 
+static void zombies() {
+    int status;
+    pid_t pid;
+    
+    // Loop to clean up all completed background processes
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (WIFEXITED(status)) {
+            fprintf(stderr, "Completed: %d (%d)\n", pid, WEXITSTATUS(status));
+            fflush(stderr);
+        }
+    }
+}
+
+
+static int background(const CMD *cmd) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork failed for background command");
+        return errno;
+    }
+    
+    if (pid == 0) {  // Child process
+        setpgid(0, 0);  // Put child in its own process group
+        exit(process(cmd->left));
+    }
+    
+    // Parent process
+    setpgid(pid, pid);  // Ensure child is in its own process group
+    fprintf(stderr, "Backgrounded: %d\n", pid);
+    fflush(stderr);
+    return 0;
+}
+
 int process(const CMD *cmdList) {
-    int status = 0;  // Default to success unless an error occurs
+    int status = 0;
 
     if (cmdList->type == SIMPLE) {
-        getlocalvar(cmdList);  // Set up the local variables for SIMPLE command
+        getlocalvar(cmdList);
         simple_case(cmdList, &status);
-        clear_local_vars(cmdList);  // Clear after processing SIMPLE command
+        clear_local_vars(cmdList);
     }
     else if (cmdList->type == PIPE) {
-        getlocalvar(cmdList);  // Set up for PIPE command
+        getlocalvar(cmdList);
         pipe_case(cmdList, &status);
-        clear_local_vars(cmdList);  // Clear after processing PIPE command
+        clear_local_vars(cmdList);
     }
     else if (cmdList->type == SEP_AND) {
         int left_status = process(cmdList->left);
         if (left_status == 0) {
-            getlocalvar(cmdList->right);  // Set up for right child if needed
+            getlocalvar(cmdList->right);
             status = process(cmdList->right);
-            clear_local_vars(cmdList->right);  // Clear after processing the right command
+            clear_local_vars(cmdList->right);
         } else {
             status = left_status;
         }
-        clear_local_vars(cmdList->left);  // Clear after processing the left command
+        clear_local_vars(cmdList->left);
     }
     else if (cmdList->type == SEP_OR) {
         int left_status = process(cmdList->left);
         if (left_status != 0) {
-            getlocalvar(cmdList->right);  // Set up for right child if needed
-            status = process(cmdList->right);
-            clear_local_vars(cmdList->right);  // Clear after processing the right command
-        } else {
-            status = left_status;
-        }
-        clear_local_vars(cmdList->left);  // Clear after processing the left command
-    }
-    else if (cmdList->type == SEP_END) {
-        if (cmdList->left != NULL) {
-            getlocalvar(cmdList->left);
-            status = process(cmdList->left);
-            clear_local_vars(cmdList->left);
-        }
-        if (cmdList->right != NULL) {
             getlocalvar(cmdList->right);
             status = process(cmdList->right);
             clear_local_vars(cmdList->right);
+        } else {
+            status = left_status;
         }
+        clear_local_vars(cmdList->left);
     }
-    else if(cmdList->type == SUBCMD){
-        getlocalvar(cmdList);
-        subcommand_case(cmdList, &status); 
-        clear_local_vars(cmdList);
-    }
-    else if (cmdList->type == PAR_LEFT && cmdList->toType == PAR_RIGHT){
-        getlocalvar(cmdList);
-        groupcommand_case(cmdList,&status);
-        clear_local_vars(cmdList);
+    else if (cmdList->type == SEP_END) {
+        if (cmdList->left) {
+                getlocalvar(cmdList->left);
+                status = process(cmdList->left);
+                clear_local_vars(cmdList->left);
+            }
+            
+        if (cmdList->right) {
+                getlocalvar(cmdList->right);
+                status = process(cmdList->right);
+                clear_local_vars(cmdList->right);
+            }
     }
 
-    // Update environment variable $? with the exit status
+    else if (cmdList->type == SUBCMD) {
+        getlocalvar(cmdList);
+        subcommand_case(cmdList, &status);
+        clear_local_vars(cmdList);
+    }
+    else if (cmdList->type == SEP_BG) {
+        if (cmdList->left) {
+                getlocalvar(cmdList->left);
+                status = background(cmdList);
+                clear_local_vars(cmdList->left);
+            }
+            
+            if (cmdList->right) {
+                getlocalvar(cmdList->right);
+                status = process(cmdList->right);
+                clear_local_vars(cmdList->right);
+            }
+    }
+
+    zombies();
+
     char status_str[10];
     snprintf(status_str, sizeof(status_str), "%d", status);
     setenv("?", status_str, 1);
 
     return status;
 }
+
+
 
 
 //create a split terminal 
@@ -576,3 +586,6 @@ int process(const CMD *cmdList) {
     //while loop that is continuly checkinf if there are any children that are done
     ////print out the message "backgrounded" to terminal
         //waitpid(-1) first arugment
+
+
+//issue w here doc implementation so cat is hanging when it shouldnt be 
